@@ -246,13 +246,25 @@ void vPortStartFirstTask( void )
 }
 /*-----------------------------------------------------------*/
 
-static void prvFIFOInterruptHandler()
+extern volatile bool __otherCoreIdled;
+
+static void __no_inline_not_in_flash_func(prvFIFOInterruptHandler)()
 {
-    /* We must remove the contents (which we don't care about)
-     * to clear the IRQ */
-    multicore_fifo_drain();
+    bool ts = false;
+    while (multicore_fifo_rvalid()) {
+        if (0xC0DED02E == multicore_fifo_pop_blocking()) {
+            uint32_t interrupts = save_and_disable_interrupts();
+            __otherCoreIdled = true;
+            while (__otherCoreIdled) { /* noop */ }
+            restore_interrupts(interrupts);
+        } else {
+            ts = true; /* Need a task switch */
+        }
+    }
     /* And explicitly clear any other IRQ flags */
     multicore_fifo_clear_irq();
+    /* If we only had a freeze request, don't switch */
+    if (!ts) return; 
     #if ( portRUNNING_ON_BOTH_CORES == 1 )
         portYIELD_FROM_ISR(pdTRUE);
     #elif ( configSUPPORT_PICO_SYNC_INTEROP == 1 )
@@ -496,11 +508,18 @@ void xPortPendSVHandler( void )
     );
 }
 /*-----------------------------------------------------------*/
+// SEE https://github.com/earlephilhower/FreeRTOS-Kernel/compare/f5fe79dacd723b490ae9afe1b4f5ae45aae620c6...0b55ee70ad08ab10af77f49e48a7381ac81a6827#diff-862450fb66bc1866ff88ac73b11b71baf66811f42e6d864780796ecb1240e56b
 
-void xPortSysTickHandler( void )
+extern int __holdUpPendSV;
+void __no_inline_not_in_flash_func(xPortSysTickHandler)( void )
 {
     uint32_t ulPreviousMask;
 
+    if (__holdUpPendSV)
+    {
+        // Don't try and swap tasks pre-emptively, something important is happening elsewhere
+        return;
+    }
     ulPreviousMask = portSET_INTERRUPT_MASK_FROM_ISR();
     {
         /* Increment the RTOS tick. */
